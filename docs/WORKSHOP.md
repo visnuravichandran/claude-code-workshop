@@ -10,9 +10,9 @@ Each stage builds on the previous one, so do them in order.
 > **One running task, told two ways.** As an app, you are growing a Tasks API
 > into a tiny team tracker (Tasks → Projects → Comments). As a Claude Code
 > user, you are building a small "toolkit" (memory → rules → a skill → a
-> reviewer subagent → hooks → a shareable plugin) that makes that growth fast
-> and consistent. Every feature is introduced exactly when the app gives you a
-> reason to want it.
+> reviewer subagent → permission rules → hooks → an MCP connection → a
+> shareable plugin) that makes that growth fast and consistent. Every feature is
+> introduced exactly when the app gives you a reason to want it.
 
 Official docs to keep open: the
 [feature overview](https://code.claude.com/docs/en/features-overview) is the
@@ -243,7 +243,55 @@ transcript did **not** fill up with the contents of every reviewed file.
 
 ---
 
-## Stage 5 — Hooks: enforce, don't just ask
+## Stage 5 — Permissions: allow / deny rules
+
+**Concept.** Permissions decide whether Claude Code may use a tool *without
+asking you first*. They live in the `permissions` object of
+`.claude/settings.json` as three lists — `allow`, `ask`, and `deny` — written as
+`Tool(specifier)`, e.g. `Bash(npm run test:*)`, `Edit(src/**)`, `Read(.env)`.
+Rules evaluate in the order **deny → ask → allow**; the first match wins, so a
+deny always beats an allow. MCP tools use the form `mcp__<server>__<tool>` (no
+parentheses). Docs:
+[Configure permissions](https://code.claude.com/docs/en/permissions).
+
+**Why now.** Your skill and reviewer made Claude productive — now stop it from
+interrupting you to approve `npm test` for the hundredth time, while making sure
+it can never run something destructive unattended.
+
+**Task.**
+
+1. Add an `allow` list for the commands you run constantly (tests, lint, edits
+   under `src/`), an `ask` list for things you want to confirm (`git push`), and
+   a `deny` list for the dangerous ones (`rm -rf`, reading `.env`).
+2. Run `/permissions` to see the merged, active rules.
+3. Test it: ask Claude to `rm -rf` something and watch the deny block it; ask it
+   to run the tests and watch it proceed without prompting.
+
+**Reference starting point (facilitators):** `.claude/settings.json`
+
+```json
+{
+  "permissions": {
+    "allow": ["Bash(npm run test:*)", "Bash(npm run lint)", "Edit(src/**)"],
+    "ask":   ["Bash(git push:*)"],
+    "deny":  ["Read(.env)", "Bash(rm -rf *)"]
+  }
+}
+```
+
+**Done when:** routine commands stop prompting, a denied command is refused, and
+the team can state the evaluation order (deny → ask → allow, deny wins) and the
+scope precedence (managed > local > project > user).
+
+> Talking point: permissions answer "*is Claude allowed to use this tool?*"
+> Hooks (next) answer "*what should deterministically happen when it does?*"
+> They stack — and there is a known gap where a `Read(.env)` deny can still slip
+> through, so the truly sensitive guard belongs in a `PreToolUse` hook. That is
+> the bridge into Stage 6.
+
+---
+
+## Stage 6 — Hooks: enforce, don't just ask
 
 **Concept.** A hook fires on a lifecycle event (e.g. `PostToolUse`,
 `PreToolUse`, `SessionStart`, `PreCompact`) and runs a command, HTTP request,
@@ -255,9 +303,10 @@ can *block* an action. Hooks are configured in `settings.json`
 [hooks reference](https://code.claude.com/docs/en/hooks) for the exact event
 names and the input/output (blocking) contract.
 
-**Why now.** Your CLAUDE.md says "lint must be green" and "never edit
-package-lock.json by hand," but those are only requests. Make the important ones
-guaranteed.
+**Why now.** A permission `deny` can refuse a tool call, but it cannot *do*
+anything — run your linter, reformat a file, log an action — and the `.env` deny
+from Stage 5 is not airtight. For anything that must happen (or must be truly
+blocked) every single time, you need a hook.
 
 **Task.**
 
@@ -300,7 +349,70 @@ an attempt to modify `.env` is stopped before it happens.
 
 ---
 
-## Stage 6 — Plugins: package it for the team
+## Stage 7 — MCP: connect an external service
+
+**Concept.** The Model Context Protocol lets Claude Code talk to external
+systems — databases, GitHub, browsers — through purpose-built tools, with the
+connection and authentication handled by an MCP **server**. You register servers
+with `claude mcp add`. Transports: `stdio` (a local child process), `http`
+(remote, the current standard), and the older `sse` (deprecated). Each server
+has a scope: **local** (default, just you, stored in `~/.claude.json`),
+**project** (`--scope project`, written to a committable `.mcp.json` shared with
+the team), or **user** (`--scope user`, all your projects). Docs:
+[Connect Claude Code to tools via MCP](https://code.claude.com/docs/en/mcp).
+
+**Why now.** The in-memory store resets on every restart. A real tracker needs a
+database — so connect one through MCP and let Claude query it directly, instead
+of you copy-pasting rows out of a DB client it cannot see.
+
+**Task.**
+
+1. Register a server for the team (writes `.mcp.json`, which you commit).
+2. Verify it registered, then authenticate inside a session with `/mcp`.
+3. Gate it: add a permission rule (Stage 5) so Claude can read through the
+   server but never run anything destructive.
+
+**Reference commands (facilitators):**
+
+```bash
+# remote HTTP server, shared with the team (writes .mcp.json — commit it)
+claude mcp add --scope project --transport http <name> <url>
+
+# or a local stdio server (an npm package run as a child process):
+claude mcp add <name> -- npx -y <package>
+
+claude mcp list          # confirm it registered
+claude mcp get <name>    # check status / discovered tools
+# then run /mcp inside a session to authenticate
+```
+
+Then gate the server's tools by name in `.claude/settings.json`:
+
+```json
+{
+  "permissions": {
+    "allow": ["mcp__db__query"],
+    "deny":  ["mcp__db__drop_table", "mcp__db__delete_rows"]
+  }
+}
+```
+
+**Heads-up (facilitators):** pick and test a real server *before* the session — a
+failing `claude mcp add` in front of the room kills momentum. A filesystem or
+SQLite `stdio` server is the most reliable low-setup choice; a remote `http`
+server (GitHub, Stripe) demonstrates OAuth but needs network and tokens. Use
+`http`, not the deprecated `sse`. Start a new session for `stdio` tools to appear.
+
+**Done when:** `claude mcp list` shows the server connected, Claude can call one
+of its tools, and a destructive tool is refused by your deny rule.
+
+> Talking point: MCP **connects** the capability, permissions **gate** it, and a
+> skill can document **how to use it well** (your schema, common queries). Three
+> features, one workflow.
+
+---
+
+## Stage 8 — Plugins: package it for the team
 
 **Concept.** A plugin bundles skills, subagents, hooks, and MCP servers into one
 installable unit, distributed through a **marketplace** (a Git repo or local
@@ -329,7 +441,13 @@ workshop-plugin/
   skills/new-resource/SKILL.md
   agents/code-reviewer.md
   hooks/hooks.json        # the PostToolUse lint hook
+  .mcp.json              # optional: the MCP server from Stage 7
 ```
+
+A plugin can carry hooks, skills, subagents, and MCP servers together, so the
+whole toolkit you built in Stages 3–7 travels as one install. (Permission rules
+in `settings.json` are project config rather than plugin content, so document
+those in your README for teammates to copy.)
 
 Then add it as a marketplace and install it with the `/plugin` commands
 documented in the marketplace guide (`/plugin marketplace add <path>`, then
@@ -341,7 +459,7 @@ plugin and immediately use `/workshop:new-resource` and the reviewer.
 
 ---
 
-## Stage 7 — Compaction: surviving a long task
+## Stage 9 — Compaction: surviving a long task
 
 **Concept.** Claude has a finite [context window](https://code.claude.com/docs/en/context-window).
 As a session grows, you can **compact** it — summarize the history so far and
@@ -379,9 +497,9 @@ articulate when to compact, when to clear, and what a `PreCompact` hook is for.
 
 ## Stretch goals
 
-- **MCP:** connect an external service (e.g. a real Postgres) via an
-  [MCP server](https://code.claude.com/docs/en/mcp) and migrate the store off
-  in-memory. Pair it with a skill documenting the schema.
+- **Finish the MCP migration:** actually swap the in-memory store for the
+  database you connected in Stage 7, and add a skill documenting its schema and
+  common queries (MCP + Skill working together).
 - **Agent teams:** have parallel reviewers (security, tests, style) work the
   same diff — see [agent teams](https://code.claude.com/docs/en/agent-teams).
 - **More hooks:** a `SessionStart` hook that prints the current test status; a
@@ -391,19 +509,25 @@ articulate when to compact, when to clear, and what a `PreCompact` hook is for.
 
 ## Facilitator notes
 
-**Suggested timing (half day, ~3.5 hrs):**
+**Suggested timing (full session, ~4 hrs):**
 
 | Stage | Topic | Time |
 | ----- | ----- | ---- |
 | 0 | Warm-up / drive the app | 15 min |
-| 1 | CLAUDE.md | 20 min |
+| 1 | CLAUDE.md | 15 min |
 | 2 | Rules | 15 min |
 | 3 | Skills + Projects | 30 min |
-| 4 | Subagents | 25 min |
-| 5 | Hooks | 35 min |
-| 6 | Plugins | 30 min |
-| 7 | Compaction + Comments | 35 min |
-| — | Buffer / stretch / Q&A | 25 min |
+| 4 | Subagents | 20 min |
+| 5 | Permissions | 20 min |
+| 6 | Hooks | 30 min |
+| 7 | MCP | 25 min |
+| 8 | Plugins | 20 min |
+| 9 | Compaction + Comments | 30 min |
+| — | Buffer / stretch / Q&A | 20 min |
+
+> Short on time? For a 30-minute taster, do Stages 1, 3, 5, and 6 hands-on
+> (CLAUDE.md → Skill → Permissions → Hooks) and demo the rest. See
+> `ASSIGNMENT.md` for that condensed run.
 
 **Format tips**
 
@@ -425,8 +549,11 @@ articulate when to compact, when to clear, and what a `PreCompact` hook is for.
 
 **Discussion prompts to close on**
 
-- Which belongs in CLAUDE.md vs a rule vs a skill vs a hook? (Always-true →
-  CLAUDE.md; path-specific → rule; on-demand workflow → skill; must-always-run →
-  hook.)
-- Where would a prompt instruction have failed where a hook succeeded?
+- Which belongs in CLAUDE.md vs a rule vs a skill vs a hook vs a permission
+  rule? (Always-true → CLAUDE.md; path-specific → rule; on-demand workflow →
+  skill; must-always-run → hook; "may Claude use this tool at all" → permission.)
+- When do you reach for MCP instead of a skill? (External system or live data →
+  MCP; knowledge about *how* to use it → skill. They pair.)
+- Where would a prompt instruction have failed where a hook or a deny rule
+  succeeded?
 - What would you package into your *team's* plugin on Monday?
